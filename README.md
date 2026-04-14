@@ -6,7 +6,7 @@ This is the official implementation of the following paper:
 
 
 <div align="center">
-  <img src="https://github.com/hexin5515/MbaGCN/blob/main/Image/MbaGCN.jpg" width="1600px"/>
+  <img src="https://github.com/hexin5515/MbaRGCN/blob/main/Image/MbaRGCN.png" width="1600px"/>
 </div>
 
 ## Environment Setup
