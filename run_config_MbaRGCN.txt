@@ -1,0 +1,22 @@
+#MbaRGCN
+# attacked graph (GraD) 5%-25% 1:1:8
+python training_non_targeted.py --dataset Cora_ML --lr 0.01 --net GCN_mamba_Net_pro_max --layer_num 9 --d_model 128 --d_inner 128 --dt_rank 32 --d_state 32 --weight_decay 5e-3 --dropout 0.75 --mamba_dropout 0.1 --runs 10
+
+python training_non_targeted.py --dataset Citeseer --lr 0.02 --net GCN_mamba_Net_pro_max --layer_num 9 --d_model 256 --d_inner 256 --dt_rank 16 --d_state 16 --weight_decay 5e-3 --dropout 0.75 --mamba_dropout 0.1 --runs 10
+
+python training_non_targeted.py --dataset Pubmed --lr 0.01 --net GCN_mamba_Net_pro_max --layer_num 9 --d_model 128 --d_inner 128 --dt_rank 32 --d_state 32 --weight_decay 5e-3 --dropout 0.75 --mamba_dropout 0.1 --runs 10
+
+# over-smoothing 6:2:2
+python training_over_smoothing.py --dataset Cora_ML --lr 0.01 --net GCN_mamba_Net_pro_max --layer_num 9 --d_model 128 --d_inner 128 --dt_rank 8 --d_state 8 --weight_decay 1e-3 --dropout 0.6 --mamba_dropout 0.1 --runs 10 --device 3
+
+python training_over_smoothing.py --dataset Citeseer --lr 0.02 --net GCN_mamba_Net_pro_max --layer_num 17 --d_model 128 --d_inner 128 --dt_rank 16 --d_state 16 --weight_decay 1e-3 --dropout 0.75 --mamba_dropout 0.1 --runs 10
+
+python training_over_smoothing.py --dataset Pubmed --lr 0.005 --net GCN_mamba_Net_pro_max --layer_num 3 --d_model 128 --d_inner 128 --dt_rank 16 --d_state 8 --weight_decay 5e-2  --dropout 0.2 --mamba_dropout 0.1 --runs 10 --device 3
+
+python training_over_smoothing.py --dataset Computers --lr 0.005 --net GCN_mamba_Net_pro_max --d_model 128 --d_inner 128 --dt_rank 32 --d_state 1 --weight_decay 1e-3 --dropout 0.6 --mamba_dropout 0.1 --runs 10 --layer_num 5 --device 0
+
+python training_over_smoothing.py --dataset Photo --lr 0.005 --net GCN_mamba_Net_pro_max --d_model 128 --d_inner 128 --dt_rank 32 --d_state 4 --weight_decay 1e-3 --dropout 0.5 --mamba_dropout 0.1 --runs 10 --layer_num 5 --device 3
+
+python training_over_smoothing.py --dataset Actor --lr 0.01 --net GCN_mamba_Net_pro_max --d_model 64 --d_inner 64 --dt_rank 64 --d_state 4 --weight_decay 5e-3 --dropout 0.5 --mamba_dropout 0.1 --runs 10 --layer_num 17 --device 2 --bias 1
+
+python training_over_smoothing.py --dataset Wisconsin --lr 0.01 --net GCN_mamba_Net_pro_max --d_model 64 --d_inner 64 --dt_rank 64 --d_state 4 --weight_decay 5e-3 --dropout 0.5 --mamba_dropout 0.1 --runs 10 --layer_num 33 --device 0 --bias 1
