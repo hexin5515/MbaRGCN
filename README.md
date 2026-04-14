@@ -25,6 +25,6 @@ This is the official implementation of the following paper:
 
 The main experiments:
 ```
-python training_non_targeted.py --dataset Cora_ML --lr 0.01 --net GCN_mamba_Net_pro_max --layer_num 9 --d_model 128 --d_inner 128 --dt_rank 32 --d_state 32 --weight_decay 5e-3 --dropout 0.75 --mamba_dropout 0.1 --runs 10
+python training_over_smoothing.py --dataset Cora_ML --lr 0.01 --net GCN_mamba_Net_pro_max --layer_num 9 --d_model 128 --d_inner 128 --dt_rank 8 --d_state 8 --weight_decay 1e-3 --dropout 0.6 --mamba_dropout 0.1 --runs 10
 ```
 Note: The dataset will be automatically downloaded when the code is executed
