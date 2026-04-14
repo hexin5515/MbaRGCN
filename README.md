@@ -2,7 +2,7 @@
 
 This is the official implementation of the following paper:
 
-> [Mamba-based Robust Graph Convolutional Network]
+> Mamba-based Robust Graph Convolutional Network
 
 
 <div align="center">
