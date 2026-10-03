@@ -226,12 +226,6 @@ if __name__ == '__main__':
     print("---------------------------------------------")
     dataset = DataLoader(args.dataset)
     data = dataset[0]
-    cluster_data = ClusterData(data, num_parts=args.cluster, recursive=False)
-    index = torch.zeros(data.x.shape[0])
-    for i in range(args.cluster):
-        index[cluster_data.partition.node_perm[cluster_data.partition.partptr[i]:cluster_data.partition.partptr[i+1]]] = i
-    index = index.long().to(args.device)
-    data.index = index
 
     args.device = torch.device('cuda:'+str(args.device) if torch.cuda.is_available() else 'cpu')
     modified_adj = np.loadtxt('./attacked_data_for_MbaGCN/GraD_modified_{}_0.05.txt'.format(args.dataset.lower()),delimiter=' ')
@@ -249,6 +243,13 @@ if __name__ == '__main__':
     deg_inv_sqrt[deg_inv_sqrt == float('inf')] = 0
     adj_t = deg_inv_sqrt.view(-1, 1) * adj_t * deg_inv_sqrt.view(1, -1)
     data.adj_t = adj_t.to_dense()
+
+    cluster_data = ClusterData(data, num_parts=args.cluster, recursive=False)
+    index = torch.zeros(data.x.shape[0])
+    for i in range(args.cluster):
+        index[cluster_data.partition.node_perm[cluster_data.partition.partptr[i]:cluster_data.partition.partptr[i+1]]] = i
+    index = index.long().to(args.device)
+    data.index = index
 
 
     percls_trn = int(round(args.train_rate*len(data.y)/dataset.num_classes))
