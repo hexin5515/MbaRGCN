@@ -239,12 +239,6 @@ if __name__ == '__main__':
     print("---------------------------------------------")
     dataset = DataLoader(args.dataset)
     data = dataset[0]
-    cluster_data = ClusterData(data, num_parts=args.cluster, recursive=False)
-    index = torch.zeros(data.x.shape[0])
-    for i in range(args.cluster):
-        index[cluster_data.partition.node_perm[cluster_data.partition.partptr[i]:cluster_data.partition.partptr[i+1]]] = i
-    index = index.long().to(args.device)
-    data.index = index
 
     device = torch.device('cuda:'+str(args.device) if torch.cuda.is_available() else 'cpu')
     adj_t = SparseTensor(row=data.edge_index[0], col=data.edge_index[1], sparse_sizes=(data.num_nodes, data.num_nodes))
