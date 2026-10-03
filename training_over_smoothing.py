@@ -11,7 +11,7 @@ import numpy as np
 from torch_geometric.datasets import Planetoid
 import time
 from torch_geometric.utils import to_dense_adj, add_self_loops, remove_self_loops, dropout_adj
-from torch_geometric.loader import ClusterData
+from sklearn.cluster import KMeans
 
 
 
