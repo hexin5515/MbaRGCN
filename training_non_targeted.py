@@ -11,7 +11,7 @@ import numpy as np
 from torch_geometric.datasets import Planetoid
 import time
 from torch_geometric.utils import to_dense_adj, add_self_loops, remove_self_loops, dropout_adj
-from torch_geometric.loader import ClusterData
+from sklearn.cluster import KMeans
 
 
 
@@ -94,19 +94,45 @@ def RunExp(args, dataset, data, Net, rb, val_lb):
 
         labels = data.y.to(args.device)
 
+        # Normalize the initial node features before clustering.
+        cluster_features = F.normalize(
+            data.x.detach().float(),
+            p=2,
+            dim=1
+        ).cpu().numpy()
+        
+        train_mask_np = data.train_mask.detach().cpu().numpy().astype(bool)
+        
+        # Fit K-means using training-node features only.
+        kmeans = KMeans(
+            n_clusters=args.cluster,
+            random_state=42,
+            n_init=10
+        )
+        kmeans.fit(cluster_features[train_mask_np])
+        
+        # Assign all nodes to their nearest training-derived center.
+        cluster_assignments = kmeans.predict(cluster_features)
+        
+        data.index = torch.as_tensor(
+            cluster_assignments,
+            dtype=torch.long
+        )
+        
+        data.feature_cluster_centers = torch.as_tensor(
+            kmeans.cluster_centers_,
+            dtype=data.x.dtype
+        )
+        
+        # Move the assignments to the same device as the masks.
+        index = data.index.to(args.device)
+
         cluster_train_id = one_hot(index[idx_train].cpu(), args.cluster).to(args.device)
         cluster_train_label = one_hot(labels[idx_train].cpu(), dataset.num_classes).to(args.device)
         cluster_train_label = torch.mm(cluster_train_id.t(), cluster_train_label)
         cluster_train_label = cluster_train_label / cluster_train_label.sum(1).unsqueeze(1)
         data.cluster_train_label = cluster_train_label
         data.cluster_train_id = cluster_train_id
-        
-        cluster_val_id = one_hot(index[idx_train+idx_val].cpu(), args.cluster).to(args.device)
-        cluster_val_label = one_hot(labels[idx_train+idx_val].cpu(), dataset.num_classes).to(args.device)
-        cluster_val_label = torch.mm(cluster_val_id.t(), cluster_val_label)
-        cluster_val_label = cluster_val_label / cluster_val_label.sum(1).unsqueeze(1)
-        data.cluster_val_label = cluster_val_label
-        data.cluster_val_id = cluster_val_id
 
 
     model, data = tmp_net.to(args.device), data.to(args.device)
@@ -243,13 +269,6 @@ if __name__ == '__main__':
     deg_inv_sqrt[deg_inv_sqrt == float('inf')] = 0
     adj_t = deg_inv_sqrt.view(-1, 1) * adj_t * deg_inv_sqrt.view(1, -1)
     data.adj_t = adj_t.to_dense()
-
-    cluster_data = ClusterData(data, num_parts=args.cluster, recursive=False)
-    index = torch.zeros(data.x.shape[0])
-    for i in range(args.cluster):
-        index[cluster_data.partition.node_perm[cluster_data.partition.partptr[i]:cluster_data.partition.partptr[i+1]]] = i
-    index = index.long().to(args.device)
-    data.index = index
 
 
     percls_trn = int(round(args.train_rate*len(data.y)/dataset.num_classes))
