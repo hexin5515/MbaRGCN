@@ -1,83 +1,29 @@
-"""Large-graph oversmoothing experiment.
-
-This script is intentionally separate from training_over_smoothing.py. It keeps
-the graph sparse, trains Mamba with classification and KMeans cluster contrastive
-losses, and records layer-wise smoothing statistics for Mamba and a sparse GCN
-reference. KMeans follows training_non_targeted.py; --contrastive_weight 0
-disables clustering and the auxiliary loss.
-
-Examples:
-  python training_large_scale_oversmoothing.py --dataset computers --model both
-  python training_large_scale_oversmoothing.py --dataset arxiv --model mamba \
-      --layers 5 --d_model 128 --d_inner 128 --d_state 4
-  python training_large_scale_oversmoothing.py --dataset reddit --model mamba \
-      --layers 2 --d_model 64 --d_inner 64 --no_metrics
-"""
-
 import argparse
 import csv
 import gc
-import os
+import json
+import math
 import random
+import tempfile
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import sklearn
 import torch
 import torch.nn.functional as F
+import torch_geometric
+import torch_sparse
 from sklearn.cluster import KMeans
-from torch import nn
-from torch_geometric.nn import GCNConv
+from torch_geometric.datasets import Amazon, Reddit
+from torch_geometric.transforms import NormalizeFeatures
 from torch_geometric.utils import is_undirected, to_undirected
 from torch_sparse import SparseTensor
 
-from dataset_loader import DataLoader
 from models import GCN_mamba_Net_pro_max
-from training_curves import CurveRecorder, prepare_curve_directory
 
 
-OGB_NAMES = {
-    "arxiv": "ogbn-arxiv",
-    "products": "ogbn-products",
-}
-
-
-class DatasetView:
-    """Small adapter exposing the attributes used by the existing Mamba model."""
-
-    def __init__(self, data, num_classes):
-        self.data = data
-        self.num_features = data.num_features
-        self.num_classes = int(num_classes)
-
-    def __getitem__(self, index):
-        return self.data
-
-
-class SparseGCN(nn.Module):
-    def __init__(self, num_features, num_classes, hidden, layers, dropout):
-        super().__init__()
-        if layers < 2:
-            raise ValueError("--layers must be at least 2 for the GCN baseline")
-        self.dropout = dropout
-        self.convs = nn.ModuleList()
-        # The graph is normalized once up front and kept as a SparseTensor.
-        # Avoiding GCNConv's per-layer COO normalization matters on large graphs.
-        conv_kwargs = {"add_self_loops": False, "normalize": False}
-        self.convs.append(GCNConv(num_features, hidden, **conv_kwargs))
-        for _ in range(layers - 1):
-            self.convs.append(GCNConv(hidden, hidden, **conv_kwargs))
-        self.classifier = nn.Linear(hidden, num_classes)
-
-    def forward(self, data, return_hidden=True):
-        x = data.x
-        hidden = []
-        for conv in self.convs:
-            x = conv(x, data.adj_t)
-            x = F.relu(x)
-            x = F.dropout(x, p=self.dropout, training=self.training)
-            if return_hidden:
-                hidden.append(x)
-        return (hidden if return_hidden else None), self.classifier(x)
+OGB_NAMES = {"arxiv": "ogbn-arxiv", "products": "ogbn-products"}
 
 
 def seed_everything(seed):
@@ -88,656 +34,292 @@ def seed_everything(seed):
         torch.cuda.manual_seed_all(seed)
 
 
-def random_split(num_nodes, seed):
-    """Create a deterministic 1:1:8 node split from a random permutation."""
-    generator = torch.Generator().manual_seed(seed)
-    permutation = torch.randperm(num_nodes, generator=generator)
-    train_end = int(0.1 * num_nodes)
-    val_end = train_end + int(0.1 * num_nodes)
-    return (
-        permutation[:train_end],
-        permutation[train_end:val_end],
-        permutation[val_end:],
-    )
-
-
-def apply_split_masks(data, split_indices):
-    for mask_name, indices in zip(
-        ("train_mask", "val_mask", "test_mask"), split_indices
-    ):
-        mask = torch.zeros(
-            data.num_nodes, dtype=torch.bool, device=data.y.device
+def set_split(data, seed, official=None):
+    if official is None:
+        order = torch.randperm(
+            data.num_nodes, generator=torch.Generator().manual_seed(seed)
         )
-        mask[indices.view(-1).long().to(mask.device)] = True
-        setattr(data, mask_name, mask)
+        count = int(0.1 * data.num_nodes)
+        indices = (order[:count], order[count:2 * count], order[2 * count:])
+    else:
+        indices = (official["train"], official["valid"], official["test"])
+    for name, index in zip(("train_mask", "val_mask", "test_mask"), indices):
+        mask = torch.zeros(data.num_nodes, dtype=torch.bool, device=data.y.device)
+        mask[index.view(-1).long().to(mask.device)] = True
+        if not mask.any():
+            raise ValueError(f"{name} must contain at least one node")
+        setattr(data, name, mask)
 
 
-def kmeans_node_clusters(features, num_clusters):
-    """Match the feature normalization and KMeans in training_non_targeted.py."""
-    if not 1 <= num_clusters <= features.size(0):
-        raise ValueError("--cluster must be between 1 and the number of nodes")
-    cluster_features = F.normalize(
-        features.detach().cpu().float(), p=2, dim=1
-    ).numpy()
-    assignments = KMeans(
-        n_clusters=num_clusters, random_state=42, n_init=10
-    ).fit_predict(cluster_features)
-    return torch.as_tensor(assignments, dtype=torch.long)
-
-
-def prepare_cluster_targets(data, num_clusters, num_classes):
-    """Build cluster label distributions using only the current training split."""
-    cluster_ids = data.index[data.train_mask]
-    labels = data.y[data.train_mask]
-    counts = torch.bincount(
-        cluster_ids * num_classes + labels,
-        minlength=num_clusters * num_classes,
-    ).reshape(num_clusters, num_classes).float()
-    totals = counts.sum(dim=1, keepdim=True)
-    # Integer cross-entropy targets are equivalent to the reference's one-hot
-    # targets without allocating a train_nodes x clusters matrix on large graphs.
-    data.cluster_train_id = cluster_ids
-    data.cluster_train_label = counts / totals.clamp_min(1)
-    data.cluster_train_active = totals.squeeze(1) > 0
-
-
-def load_graph(name, root, split_mode="random", seed=42):
-    name = name.lower()
-    if split_mode == "official" and name not in OGB_NAMES:
-        raise ValueError("--split official is only available for arxiv and products")
-    if name in OGB_NAMES:
+def load_graph(args):
+    official = None
+    if args.dataset in OGB_NAMES:
         from ogb.nodeproppred import PygNodePropPredDataset
 
-        dataset = PygNodePropPredDataset(name=OGB_NAMES[name], root=root)
-        data = dataset[0]
-        num_classes = int(dataset.num_classes)
-        if split_mode == "official":
-            split = dataset.get_idx_split()
-            split_indices = (split["train"], split["valid"], split["test"])
-        else:
-            split_indices = random_split(data.num_nodes, seed)
-    elif name == "reddit":
-        from torch_geometric.datasets import Reddit
-
-        # PyG downloads and caches the public Reddit node-classification
-        # dataset under ``<root>/reddit``.  Its bundled masks are intentionally
-        # ignored so every dataset in this script uses the same seeded 1:1:8
-        # split controlled by ``--seed``.
-        dataset = Reddit(root=os.path.join(root, "reddit"))
-        data = dataset[0]
-        num_classes = int(dataset.num_classes)
-        split_indices = random_split(data.num_nodes, seed)
+        dataset = PygNodePropPredDataset(name=OGB_NAMES[args.dataset], root=args.root)
+        if args.split == "official":
+            official = dataset.get_idx_split()
+    elif args.dataset == "reddit":
+        dataset = Reddit(root=str(Path(args.root) / "reddit"))
     else:
-        dataset = DataLoader(name)
-        data = dataset[0]
-        num_classes = int(data.y.view(-1).max().item()) + 1
-        split_indices = random_split(data.num_nodes, seed)
-
+        dataset = Amazon(
+            root=str(Path(args.root) / args.dataset), name=args.dataset,
+            transform=NormalizeFeatures(),
+        )
+    data = dataset[0]
     data.y = data.y.view(-1).long()
-
-    apply_split_masks(data, split_indices)
-
     if getattr(data, "edge_index", None) is None:
-        if getattr(data, "adj_t", None) is None:
-            raise ValueError("The dataset has neither edge_index nor adj_t")
         row, col, _ = data.adj_t.coo()
-        data.edge_index = torch.stack((row, col), dim=0)
-
-    # Reddit is already stored as an undirected COO graph by PyG.  Avoid both
-    # the conversion and the full-graph symmetry check, which would create a
-    # costly sort/temporary tensor at Reddit scale.
-    if name != "reddit" and not is_undirected(
+        data.edge_index = torch.stack((col, row), dim=0)
+    # Reddit is already undirected; avoid sorting its large edge tensor.
+    if args.dataset != "reddit" and not is_undirected(
         data.edge_index, num_nodes=data.num_nodes
     ):
         data.edge_index = to_undirected(data.edge_index, num_nodes=data.num_nodes)
-    return dataset, data, num_classes
+    return data, int(dataset.num_classes), official
 
 
-def normalized_sparse_adjacency(edge_index, num_nodes):
+def normalized_adjacency(edge_index, num_nodes):
+    """D^(-1/2) (A + I) D^(-1/2), stored as a sparse tensor."""
     adj = SparseTensor(
-        row=edge_index[0],
-        col=edge_index[1],
-        sparse_sizes=(num_nodes, num_nodes),
-    )
-    adj = adj + SparseTensor.eye(num_nodes)
-    degree = adj.sum(dim=1).to(torch.float)
-    degree_inv_sqrt = degree.pow(-0.5)
-    degree_inv_sqrt[torch.isinf(degree_inv_sqrt)] = 0
-    return (
-        degree_inv_sqrt.view(-1, 1)
-        * adj
-        * degree_inv_sqrt.view(1, -1)
-    )
+        row=edge_index[0], col=edge_index[1], sparse_sizes=(num_nodes, num_nodes)
+    ) + SparseTensor.eye(num_nodes)
+    inv_sqrt = adj.sum(dim=1).float().pow(-0.5)
+    inv_sqrt[torch.isinf(inv_sqrt)] = 0
+    return inv_sqrt.view(-1, 1) * adj * inv_sqrt.view(1, -1)
 
 
-def mamba_args(args, dataset_name):
-    return SimpleNamespace(
-        dataset=dataset_name,
-        d_model=args.d_model,
-        d_inner=args.d_inner,
-        dt_rank=args.dt_rank,
-        d_state=args.d_state,
-        layer_num=args.layers,
-        dropout=args.dropout,
-        mamba_dropout=args.mamba_dropout,
-        bias=args.bias,
-        readout="last",
-        gpr_alpha=0.1,
-        layer_fusion=args.layer_fusion,
-        fusion_heads=args.fusion_heads,
-        fusion_dropout=args.fusion_dropout,
-        fusion_hidden=args.fusion_hidden,
-    )
+def kmeans_clusters(features, num_clusters):
+    features = F.normalize(features.detach().cpu().float(), p=2, dim=1).numpy()
+    assignments = KMeans(
+        n_clusters=num_clusters, random_state=42, n_init=10
+    ).fit_predict(features)
+    return torch.as_tensor(assignments, dtype=torch.long)
 
 
-def mamba_hidden(model, data, model_args, return_hidden=True,
-                 contrastive_mask=None):
-    x = model.lin1(data.x)
-    x = model.norm_1(x)
-    x = F.relu(x)
-    x = F.dropout(x, p=model.dropout, training=model.training)
-
-    # The original block materializes deltaA and deltaB_u for every layer at
-    # once.  Since its input is the same feature matrix at each scan step, the
-    # input projection can be computed once and the state can be advanced one
-    # layer at a time.  This is algebraically equivalent and keeps peak memory
-    # proportional to one layer's state instead of all layers' states.
-    block = model.mamba
-    d_inner, d_state = block.A_log.shape
-    projected = block.x_proj(x)
-    delta, B, C = projected.split(
-        [model_args.dt_rank, d_state, d_state], dim=-1
-    )
-    delta = F.softplus(block.dt_proj(delta))
-    A = -torch.exp(block.A_log.float())
-    D = block.D.float() if block.D is not None else None
-    state = torch.zeros(
-        (x.size(0), d_inner, d_state), device=x.device, dtype=delta.dtype
-    )
-
-    reinject_source = model_args.layer_fusion == "s3tm"
-    if reinject_source:
-        # These tensors depend only on the shared input x and learned
-        # parameters, so S3TM can reuse one copy across all scan steps.
-        delta_a = torch.exp(delta.unsqueeze(-1) * A.unsqueeze(0))
-        delta_b_u = (
-            delta.unsqueeze(-1)
-            * B.unsqueeze(1)
-            * x.unsqueeze(-1)
-        )
-    else:
-        # Ablations receive the source only at the first step. Reusing x at
-        # every step would leave a shallow bypass after removing +x/Du.
-        zero_input = torch.zeros_like(x)
-        zero_projected = block.x_proj(zero_input)
-        zero_delta, zero_B, zero_C = zero_projected.split(
-            [model_args.dt_rank, d_state, d_state], dim=-1
-        )
-        zero_delta = F.softplus(block.dt_proj(zero_delta))
-
-    collect_layers = return_hidden or model_args.layer_fusion != "s3tm"
-    outputs = [] if collect_layers else None
-    last_output = None
-    contrastive_output = None
-    contrastive_layer = min(1, model_args.layer_num - 1)
-    for layer in range(model_args.layer_num):
-        if reinject_source:
-            state = delta_a * state + delta_b_u
-            y = (state * C.unsqueeze(1)).sum(dim=-1)
-        else:
-            if layer == 0:
-                step_delta, step_B, step_C, step_input = delta, B, C, x
-            else:
-                step_delta, step_B, step_C, step_input = (
-                    zero_delta, zero_B, zero_C, zero_input
-                )
-            delta_a_step = torch.exp(
-                step_delta.unsqueeze(-1) * A.unsqueeze(0)
-            )
-            delta_b_u_step = (
-                step_delta.unsqueeze(-1)
-                * step_B.unsqueeze(1)
-                * step_input.unsqueeze(-1)
-            )
-            state = delta_a_step * state + delta_b_u_step
-            y = (state * step_C.unsqueeze(1)).sum(dim=-1)
-        state = data.adj_t @ state.reshape(x.size(0), d_inner * d_state)
-        state = state.reshape(x.size(0), d_inner, d_state)
-        state = F.relu(state)
-        state = F.dropout(state, p=block.mamba_dropout, training=model.training)
-        current_output = block.out_proj(y + x * D) if D is not None else block.out_proj(y)
-        if collect_layers:
-            outputs.append(current_output)
-        if not collect_layers:
-            last_output = current_output
-            if contrastive_mask is not None and layer == contrastive_layer:
-                # Retain only the training nodes at the contrastive layer.
-                contrastive_output = (
-                    current_output[contrastive_mask] + x[contrastive_mask]
-                )
-    if collect_layers:
-        hidden = torch.stack(outputs, dim=1)
-        if model_args.layer_fusion == "s3tm":
-            hidden = hidden + x.unsqueeze(1)
-        hidden = F.relu(hidden)
-        hidden = F.dropout(hidden, p=model.dropout, training=model.training)
-        if contrastive_mask is not None:
-            return hidden, hidden[contrastive_mask, contrastive_layer, :]
-        return hidden
-    last_output = last_output + x
-    last_output = F.relu(last_output)
-    last_output = F.dropout(last_output, p=model.dropout, training=model.training)
-    if contrastive_mask is not None:
-        if contrastive_layer == model_args.layer_num - 1:
-            contrastive_output = last_output[contrastive_mask]
-        else:
-            contrastive_output = F.dropout(
-                F.relu(contrastive_output), p=model.dropout, training=model.training
-            )
-        return last_output, contrastive_output
-    return last_output
-
-
-def forward_model(model_name, model, data, model_args=None, return_hidden=True):
-    if model_name == "mamba":
-        hidden = mamba_hidden(model, data, model_args, return_hidden=return_hidden)
-        if return_hidden:
-            return hidden, model.fused_logits(hidden)
-        if model_args.layer_fusion != "s3tm":
-            return None, model.fused_logits(hidden)
-        return None, model.lin2(hidden)
-    hidden, logits = model(data, return_hidden=return_hidden)
-    return (torch.stack(hidden, dim=1) if return_hidden else None), logits
-
-
-def mamba_training_outputs(model, data, model_args):
-    """Return final logits and the reference's contrastive-layer log probabilities."""
-    hidden, contrastive_hidden = mamba_hidden(
-        model, data, model_args, return_hidden=False,
-        contrastive_mask=data.train_mask,
-    )
-    if model_args.layer_fusion == "s3tm":
-        logits = model.lin2(hidden)
-    else:
-        logits = model.fused_logits(hidden)
-    if model_args.layer_num <= 2:
-        # The reference replaces the final layer's slot with the fused output.
-        contrastive_logits = logits[data.train_mask]
-    else:
-        contrastive_logits = model.lin2(contrastive_hidden)
-    return logits, F.log_softmax(contrastive_logits, dim=-1)
+def cluster_targets(data, num_clusters, num_classes):
+    """Training-only class distributions for the fixed feature clusters."""
+    targets = data.cluster_id[data.train_mask]
+    counts = torch.bincount(
+        targets * num_classes + data.y[data.train_mask],
+        minlength=num_clusters * num_classes,
+    ).reshape(num_clusters, num_classes).float()
+    totals = counts.sum(dim=1, keepdim=True)
+    return targets, counts / totals.clamp_min(1), totals.squeeze(1) > 0
 
 
 def accuracy(logits, labels, mask):
-    prediction = logits[mask].argmax(dim=-1)
-    return prediction.eq(labels[mask]).float().mean().item()
+    return (logits[mask].argmax(-1) == labels[mask]).float().mean().item()
 
 
-def train_model(model_name, model, data, model_args, args,
-                curve_recorder=None, run=1, seed=None):
+def train(model, data, num_classes, args, run, seed, history_writer):
     optimizer = torch.optim.Adam(
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay
     )
-    best_val = -1.0
-    best_test = 0.0
-    best_epoch = 0
-    history = []
-    use_contrastive = model_name == "mamba" and args.contrastive_weight > 0
+    use_contrastive = args.contrastive_weight > 0
     if use_contrastive:
-        prepare_cluster_targets(data, args.cluster, model.lin2.out_features)
+        targets, prototypes, active = cluster_targets(data, args.cluster, num_classes)
+    best_epoch, best_val, best_test = 0, -1.0, 0.0
 
     for epoch in range(1, args.epochs + 1):
         model.train()
         optimizer.zero_grad(set_to_none=True)
+        layer_log_probs = model(model.args, data)
+        train_log_probs = layer_log_probs[data.train_mask]
+        loss = F.nll_loss(train_log_probs[:, -1, :], data.y[data.train_mask])
         if use_contrastive:
-            logits, contrastive_log_probs = mamba_training_outputs(
-                model, data, model_args
-            )
-        else:
-            _, logits = forward_model(
-                model_name, model, data, model_args, return_hidden=False
-            )
-        loss = F.cross_entropy(logits[data.train_mask], data.y[data.train_mask])
-        if use_contrastive:
-            logits_contrast = (
-                contrastive_log_probs @ data.cluster_train_label.t()
-            ) / args.tau
-            # Some KMeans clusters may have no nodes in this training split.
-            logits_contrast = logits_contrast.masked_fill(
-                ~data.cluster_train_active.unsqueeze(0), -torch.inf
-            )
-            loss = loss + args.contrastive_weight * F.cross_entropy(
-                logits_contrast, data.cluster_train_id
-            )
+            log_probs = train_log_probs[:, min(1, args.layers - 1), :]
+            cluster_logits = (log_probs @ prototypes.t()) / args.tau
+            # Ignore clusters without training nodes in this particular run.
+            cluster_logits = cluster_logits.masked_fill(~active.unsqueeze(0), -torch.inf)
+            loss = loss + args.contrastive_weight * F.cross_entropy(cluster_logits, targets)
         loss.backward()
         optimizer.step()
 
-        should_eval = epoch == 1 or epoch % args.eval_interval == 0 or epoch == args.epochs
-        if not should_eval:
+        if epoch != 1 and epoch % args.eval_interval != 0 and epoch != args.epochs:
             continue
-
         model.eval()
         with torch.inference_mode():
-            _, eval_logits = forward_model(
-                model_name, model, data, model_args, return_hidden=False
+            eval_logits = model(model.args, data)[:, -1, :]
+            train_acc, val_acc, test_acc = (
+                accuracy(eval_logits, data.y, mask)
+                for mask in (data.train_mask, data.val_mask, data.test_mask)
             )
-            train_acc = accuracy(eval_logits, data.y, data.train_mask)
-            val_acc = accuracy(eval_logits, data.y, data.val_mask)
-            test_acc = accuracy(eval_logits, data.y, data.test_mask)
-
-        history.append((epoch, loss.item(), train_acc, val_acc, test_acc))
-        if curve_recorder is not None:
-            curve_recorder.record(
-                run, seed, epoch, loss.item(), train_acc, val_acc, test_acc
-            )
+        history_writer.writerow((run, seed, epoch, loss.item(), train_acc, val_acc, test_acc))
         if val_acc > best_val:
-            best_val = val_acc
-            best_test = test_acc
-            best_epoch = epoch
-
+            best_epoch, best_val, best_test = epoch, val_acc, test_acc
         print(
-            f"{model_name} epoch={epoch} loss={loss.item():.4f} "
+            f"run={run} epoch={epoch} loss={loss.item():.4f} "
             f"train={train_acc:.4f} val={val_acc:.4f} test={test_acc:.4f}",
             flush=True,
         )
-
-        if (
-            args.early_stopping > 0
-            and epoch - best_epoch >= args.early_stopping
-        ):
-            print(
-                f"{model_name} early_stop epoch={epoch} "
-                f"best_epoch={best_epoch}",
-                flush=True,
-            )
+        if args.early_stopping > 0 and epoch - best_epoch >= args.early_stopping:
             break
+    return dict(best_epoch=best_epoch, best_val=best_val, best_test=best_test, final_epoch=epoch)
 
-    return history, best_epoch, best_val, best_test
 
-
-def layer_metrics(hidden, logits, data, args, generator):
-    num_nodes, num_layers = hidden.shape[:2]
-    node_count = min(args.metric_nodes, num_nodes)
-    node_sample = torch.randperm(num_nodes, generator=generator, device=hidden.device)[:node_count]
-
-    row, col = data.edge_index
-    edge_count = min(args.metric_edges, row.numel())
-    edge_sample = torch.randperm(row.numel(), generator=generator, device=hidden.device)[:edge_count]
-    row = row[edge_sample]
-    col = col[edge_sample]
-
+def smoothing_metrics(hidden, logits, data, args, seed):
+    generator = torch.Generator(device=hidden.device).manual_seed(seed)
+    nodes = torch.randperm(data.num_nodes, generator=generator, device=hidden.device)
+    nodes = nodes[:args.metric_nodes]
+    edges = torch.randperm(
+        data.edge_index.size(1), generator=generator, device=hidden.device
+    )[:args.metric_edges]
+    row, col = data.edge_index[:, edges]
     rows = []
-    for layer in range(num_layers):
-        current = hidden[:, layer, :]
-        sampled = current[node_sample].float()
-        edge_left = current[row].float()
-        edge_right = current[col].float()
-        variance = sampled.var(dim=0, unbiased=False).mean().item()
-        cosine = F.cosine_similarity(edge_left, edge_right, dim=-1).mean().item()
-        energy = (edge_left - edge_right).pow(2).sum(dim=-1).mean().item()
-        # The current model exposes only the final classifier output.  Keep
-        # earlier-layer accuracy empty instead of allocating another full-graph
-        # logits tensor merely to write NaN.
-        layer_acc = accuracy(logits, data.y, data.test_mask) if layer == num_layers - 1 else float("nan")
-        rows.append(
-            {
-                "layer": layer + 1,
-                "feature_variance": variance,
-                "edge_cosine": cosine,
-                "dirichlet_energy": energy,
-                "test_accuracy": layer_acc,
-            }
-        )
+    for layer in range(hidden.size(1)):
+        features = hidden[:, layer, :].float()
+        left, right = features[row], features[col]
+        rows.append(dict(
+            layer=layer + 1,
+            feature_variance=features[nodes].var(dim=0, unbiased=False).mean().item(),
+            edge_cosine=F.cosine_similarity(left, right, dim=-1).mean().item(),
+            dirichlet_energy=(left - right).pow(2).sum(-1).mean().item(),
+            test_accuracy=(accuracy(logits, data.y, data.test_mask)
+                           if layer == hidden.size(1) - 1 else ""),
+        ))
     return rows
 
 
-def write_rows(
-    path,
-    dataset,
-    split_mode,
-    model_name,
-    layer_fusion,
-    run,
-    seed,
-    rows,
-    best_epoch,
-    best_val,
-    best_test,
-):
-    fields = [
-        "dataset",
-        "split",
-        "model",
-        "layer_fusion",
-        "run",
-        "seed",
-        "best_epoch",
-        "best_val",
-        "best_test",
-        "layer",
-        "feature_variance",
-        "edge_cosine",
-        "dirichlet_energy",
-        "test_accuracy",
-    ]
-    exists = os.path.exists(path)
-    with open(path, "a", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fields)
-        if not exists:
-            writer.writeheader()
-        # Keep a summary row when layer metrics are disabled.  This makes the
-        # CSV useful for accuracy-only large-graph runs while leaving metric
-        # columns empty rather than fabricating values.
-        rows_to_write = rows or [
-            {
-                "layer": "",
-                "feature_variance": "",
-                "edge_cosine": "",
-                "dirichlet_energy": "",
-                "test_accuracy": "",
-            }
-        ]
-        for row in rows_to_write:
-            writer.writerow(
-                {
-                    "dataset": dataset,
-                    "split": split_mode,
-                    "model": model_name,
-                    "layer_fusion": layer_fusion if model_name == "mamba" else "n/a",
-                    "run": run,
-                    "seed": seed,
-                    "best_epoch": best_epoch,
-                    "best_val": best_val,
-                    "best_test": best_test,
-                    **row,
-                }
-            )
-
-
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--dataset",
-        type=lambda value: value.lower(),
-        choices=["computers", "photo", "arxiv", "products", "reddit"],
-        default="computers",
-    )
-    parser.add_argument("--model", choices=["mamba", "gcn", "both"], default="both")
-    parser.add_argument(
-        "--split",
-        choices=["random", "official"],
-        default="random",
-        help="random uses a seeded 1:1:8 split; official is available for OGB datasets",
-    )
-    parser.add_argument("--root", default="./data")
+def parse_args():
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--dataset", type=str.lower,
+                        choices=["arxiv","reddit"],
+                        default="arxiv")
+    parser.add_argument("--root", default="./data", help="dataset download/cache directory")
+    parser.add_argument("--split", choices=["random", "official"], default="random")
     parser.add_argument("--layers", type=int, default=9)
     parser.add_argument("--d_model", type=int, default=128)
     parser.add_argument("--d_inner", type=int, default=128)
     parser.add_argument("--dt_rank", type=int, default=8)
     parser.add_argument("--d_state", type=int, default=8)
-    parser.add_argument("--hidden", type=int, default=128)
     parser.add_argument("--dropout", type=float, default=0.6)
     parser.add_argument("--mamba_dropout", type=float, default=0.05)
-    parser.add_argument("--cluster", type=int, default=5, help="number of KMeans clusters")
-    parser.add_argument("--tau", type=float, default=1.0, help="cluster contrastive temperature")
-    parser.add_argument(
-        "--contrastive_weight", type=float, default=0.1,
-        help="weight of the Mamba cluster contrastive loss; 0 disables clustering",
-    )
-    parser.add_argument(
-        "--layer_fusion",
-        choices=["s3tm", "order_attention", "transformer", "gating", "mlp_filter"],
-        default="s3tm",
-        help="cross-propagation-layer fusion for the MbaRGCN model",
-    )
-    parser.add_argument("--fusion_heads", type=int, default=4)
-    parser.add_argument("--fusion_dropout", type=float, default=0.1)
-    parser.add_argument("--fusion_hidden", type=int, default=0)
     parser.add_argument("--bias", action="store_true")
+    parser.add_argument("--cluster", type=int, default=5)
+    parser.add_argument("--tau", type=float, default=1.0)
+    parser.add_argument("--contrastive_weight", type=float, default=0.1)
     parser.add_argument("--lr", type=float, default=0.02)
     parser.add_argument("--weight_decay", type=float, default=1e-3)
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--eval_interval", type=int, default=10)
-    parser.add_argument(
-        "--runs",
-        type=int,
-        default=1,
-        help="independent runs; seed, seed+1, ... control model initialization and random splits",
-    )
-    parser.add_argument(
-        "--early_stopping",
-        type=int,
-        default=200,
-        help="stop after this many epochs without validation improvement; 0 disables",
-    )
+    parser.add_argument("--early_stopping", type=int, default=200,
+                        help="epochs without validation improvement; 0 disables")
+    parser.add_argument("--runs", type=int, default=1)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--device", type=int, default=0, help="CUDA index; -1 selects CPU")
+    parser.add_argument("--no_metrics", action="store_true",
+                        help="skip layer features and final smoothing evaluation")
     parser.add_argument("--metric_nodes", type=int, default=10000)
     parser.add_argument("--metric_edges", type=int, default=100000)
-    parser.add_argument(
-        "--no_metrics",
-        action="store_true",
-        help="skip layer-wise oversmoothing metrics and their extra final forward pass",
-    )
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--device", type=int, default=0)
-    parser.add_argument("--output", default="large_scale_oversmoothing.csv")
-    parser.add_argument(
-        "--curve_dir",
-        default="",
-        help="enable convergence CSV/PNG/PDF output under this directory",
-    )
+    parser.add_argument("--output_dir", default="./results/large_scale_main")
     args = parser.parse_args()
+    for name in ("layers", "d_model", "d_inner", "dt_rank", "d_state", "cluster",
+                 "epochs", "eval_interval", "runs", "metric_nodes", "metric_edges"):
+        if getattr(args, name) < 1:
+            parser.error(f"--{name} must be positive")
+    if args.d_model != args.d_inner:
+        parser.error("--d_model and --d_inner must be equal for S3TM")
+    if not all(math.isfinite(value) for value in (
+        args.dropout, args.mamba_dropout, args.tau, args.contrastive_weight,
+        args.lr, args.weight_decay,
+    )):
+        parser.error("floating-point arguments must be finite")
+    if not (0 <= args.dropout < 1 and 0 <= args.mamba_dropout < 1):
+        parser.error("dropout probabilities must be in [0, 1)")
+    if args.tau <= 0 or args.lr <= 0 or args.contrastive_weight < 0 or args.weight_decay < 0:
+        parser.error("tau/lr must be positive; loss weight/weight decay must be non-negative")
+    if args.early_stopping < 0 or args.device < -1 or not 0 <= args.seed <= 2**32 - args.runs:
+        parser.error("invalid early_stopping, device, or run seed range")
+    if args.split == "official" and args.dataset not in OGB_NAMES:
+        parser.error("official splits are available only for arxiv and products")
+    return args
 
-    if args.runs < 1:
-        raise ValueError("--runs must be at least 1")
-    if args.epochs < 1 or args.eval_interval < 1:
-        raise ValueError("--epochs and --eval_interval must be positive")
-    if args.fusion_heads < 1 or not 0.0 <= args.fusion_dropout < 1.0:
-        raise ValueError("fusion_heads must be positive and fusion_dropout in [0, 1)")
-    if args.fusion_hidden < 0:
-        raise ValueError("fusion_hidden must be non-negative")
-    if args.cluster < 1 or args.tau <= 0 or args.contrastive_weight < 0:
-        raise ValueError("cluster and tau must be positive; contrastive_weight must be non-negative")
 
-    if args.model in ("mamba", "both") and args.d_model != args.d_inner:
-        raise ValueError(
-            "The current GCN_mamba_Net_pro_max implementation requires "
-            "--d_model and --d_inner to be equal."
-        )
-
+def main():
+    args = parse_args()
     seed_everything(args.seed)
-    curve_directory = prepare_curve_directory(args, __file__)
-    device = torch.device(f"cuda:{args.device}" if torch.cuda.is_available() else "cpu")
-    dataset, data, num_classes = load_graph(
-        args.dataset, args.root, split_mode=args.split, seed=args.seed
+    device = torch.device(
+        f"cuda:{args.device}" if args.device >= 0 and torch.cuda.is_available() else "cpu"
     )
-    if args.model in ("mamba", "both") and args.contrastive_weight > 0:
-        print(f"KMeans clustering: clusters={args.cluster} random_state=42 n_init=10", flush=True)
-        data.index = kmeans_node_clusters(data.x, args.cluster)
-    data.adj_t = normalized_sparse_adjacency(data.edge_index, data.num_nodes)
+    data, num_classes, official = load_graph(args)
+    if args.contrastive_weight > 0:
+        if args.cluster > data.num_nodes:
+            raise ValueError("--cluster cannot exceed the number of nodes")
+        print(f"KMeans: clusters={args.cluster} random_state=42 n_init=10", flush=True)
+        data.cluster_id = kmeans_clusters(data.x, args.cluster)
+    data.adj_t = normalized_adjacency(data.edge_index, data.num_nodes)
     data = data.to(device)
-    dataset_view = DatasetView(data, num_classes)
-    model_names = [args.model] if args.model != "both" else ["gcn", "mamba"]
-
+    dataset_info = SimpleNamespace(num_features=data.num_features, num_classes=num_classes)
+    model_args = SimpleNamespace(
+        **vars(args), layer_num=args.layers, layer_fusion="s3tm", readout="last"
+    )
     print(
         f"dataset={args.dataset} nodes={data.num_nodes} edges={data.edge_index.size(1)} "
-        f"features={data.num_features} classes={num_classes} "
-        f"split={args.split} device={device}",
+        f"features={data.num_features} classes={num_classes} split={args.split} device={device}",
         flush=True,
     )
 
-    for model_name in model_names:
-        best_tests = []
-        curve_recorder = (
-            CurveRecorder(curve_directory, model_name)
-            if curve_directory is not None else None
-        )
-        for run in range(1, args.runs + 1):
-            run_seed = args.seed + run - 1
-            seed_everything(run_seed)
-            if args.split == "random":
-                apply_split_masks(data, random_split(data.num_nodes, run_seed))
-            print(f"{model_name} run={run}/{args.runs} seed={run_seed}", flush=True)
-            if model_name == "mamba":
-                model_args = mamba_args(args, args.dataset)
-                model = GCN_mamba_Net_pro_max(dataset_view, model_args).to(device)
-            else:
-                model_args = None
-                model = SparseGCN(
-                    data.num_features,
-                    num_classes,
-                    args.hidden,
-                    args.layers,
-                    args.dropout,
-                ).to(device)
+    output_root = Path(args.output_dir)
+    output_root.mkdir(parents=True, exist_ok=True)
+    output = Path(tempfile.mkdtemp(prefix=args.dataset + "_", dir=str(output_root)))
+    versions = dict(torch=torch.__version__, numpy=np.__version__, sklearn=sklearn.__version__,
+                    torch_geometric=torch_geometric.__version__, torch_sparse=torch_sparse.__version__)
+    if args.dataset in OGB_NAMES:
+        import ogb
 
-            _, best_epoch, best_val, best_test = train_model(
-                model_name, model, data, model_args, args,
-                curve_recorder=curve_recorder, run=run, seed=run_seed,
-            )
-            best_tests.append(best_test)
-            if args.no_metrics:
-                rows = []
-            else:
+        versions["ogb"] = ogb.__version__
+    with (output / "config.json").open("w") as handle:
+        json.dump(dict(arguments=vars(args), device=str(device), versions=versions,
+                       model=dict(source="models.py", name="GCN_mamba_Net_pro_max",
+                                  layer_fusion="s3tm", readout="last"),
+                       kmeans=dict(random_state=42, n_init=10, normalization="l2")),
+                  handle, indent=2)
+        handle.write("\n")
+    print(f"Output directory: {output}", flush=True)
+
+    fields = ["run", "seed", "best_epoch", "best_val", "best_test", "final_epoch",
+              "metrics_epoch", "layer", "feature_variance", "edge_cosine",
+              "dirichlet_energy", "test_accuracy"]
+    best_tests = []
+    with (output / "history.csv").open("w", newline="", buffering=1) as history_file, \
+            (output / "results.csv").open("w", newline="", buffering=1) as results_file:
+        history_writer = csv.writer(history_file)
+        history_writer.writerow(("run", "seed", "epoch", "train_loss", "train_accuracy",
+                                 "val_accuracy", "test_accuracy"))
+        results_writer = csv.DictWriter(results_file, fieldnames=fields)
+        results_writer.writeheader()
+        for run in range(1, args.runs + 1):
+            seed = args.seed + run - 1
+            seed_everything(seed)
+            set_split(data, seed, official)
+            model = GCN_mamba_Net_pro_max(dataset_info, model_args).to(device)
+            result = train(model, data, num_classes, args, run, seed, history_writer)
+            best_tests.append(result["best_test"])
+            rows = [{}]
+            if not args.no_metrics:
                 model.eval()
                 with torch.inference_mode():
-                    hidden, logits = forward_model(model_name, model, data, model_args)
-                    generator = torch.Generator(device=device).manual_seed(run_seed)
-                    rows = layer_metrics(hidden, logits, data, args, generator)
-            write_rows(
-                args.output,
-                args.dataset,
-                args.split,
-                model_name,
-                args.layer_fusion,
-                run,
-                run_seed,
-                rows,
-                best_epoch,
-                best_val,
-                best_test,
-            )
+                    layer_log_probs, hidden = model(model_args, data, return_hidden=True)
+                    rows = smoothing_metrics(hidden, layer_log_probs[:, -1, :], data, args, seed)
+                del layer_log_probs, hidden
+            for row in rows:
+                results_writer.writerow(dict(
+                    run=run, seed=seed, **result,
+                    metrics_epoch="" if args.no_metrics else result["final_epoch"], **row,
+                ))
             print(
-                f"{model_name} run={run}/{args.runs} best_epoch={best_epoch} "
-                f"best_val={best_val:.4f} best_test={best_test:.4f} "
-                f"output={args.output}",
+                f"run={run}/{args.runs} best_epoch={result['best_epoch']} "
+                f"best_val={result['best_val']:.4f} best_test={result['best_test']:.4f}",
                 flush=True,
             )
             del model
-            if not args.no_metrics:
-                del hidden, logits
             gc.collect()
-            if torch.cuda.is_available():
+            if device.type == "cuda":
                 torch.cuda.empty_cache()
-
-        if curve_recorder is not None:
-            curve_recorder.plot(f"{args.dataset} / {model_name} / full graph")
-        mean_test = float(np.mean(best_tests))
-        std_test = float(np.std(best_tests, ddof=1)) if args.runs > 1 else 0.0
-        print(
-            f"{model_name} runs={args.runs} test_mean={mean_test:.4f} "
-            f"test_std={std_test:.4f}",
-            flush=True,
-        )
+    std = float(np.std(best_tests, ddof=1)) if args.runs > 1 else 0.0
+    print(f"test_mean={np.mean(best_tests):.4f} test_std={std:.4f} output={output}", flush=True)
 
 
 if __name__ == "__main__":
